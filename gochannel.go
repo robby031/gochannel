@@ -228,7 +228,7 @@ func (s *subscription[V]) len() int {
 
 // notify sends msg to all subscriber channels sequentially.
 // Sends are non-blocking: a full channel drops the message.
-// Channels that have been closed externally are detected via recover and pruned.
+// Closed channels are detected via recover and pruned defensively.
 func (s *subscription[V]) notify(msg V) {
 	s.mu.RLock()
 	channels := make([]chan V, 0, len(s.subs))
