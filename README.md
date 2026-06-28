@@ -209,13 +209,13 @@ Benchmarked on Apple M4 (darwin/arm64) with Go 1.25.8:
 | Operation | Time/op | Bytes/op | Allocs/op |
 |-----------|--------:|---------:|----------:|
 | **Publish** — no subscribers | 3.65 ns | 0 B | 0 |
-| **Publish** — 1 subscriber | 460 ns | 120 B | 5 |
-| **Publish** — 10 subscribers | 3,007 ns | 848 B | 24 |
-| **Publish** — 100 subscribers | 18,396 ns | 8,144 B | 204 |
-| **Broadcast** — 10 topics (1 sub each) | 4,330 ns | 1,280 B | 51 |
-| **Concurrent Publish** — 10 goroutines | 267 ns | 120 B | 5 |
-| **Subscribe + Unsubscribe** | 183 ns | 416 B | 4 |
-| **HasSubscribers** | 8.3 ns | 0 B | 0 |
+| **Publish** — 1 subscriber | 66 ns | 0 B | 0 |
+| **Publish** — 10 subscribers | 703 ns | 80 B | 1 |
+| **Publish** — 100 subscribers | 7,791 ns | 896 B | 1 |
+| **Broadcast** — 10 topics (1 sub each) | 1,460 ns | 80 B | 1 |
+| **Concurrent Publish** — 10 goroutines | 105 ns | 0 B | 0 |
+| **Subscribe + Unsubscribe** | 169 ns | 416 B | 4 |
+| **HasSubscribers** | 8.4 ns | 0 B | 0 |
 
 > Run the benchmarks yourself: `go test -bench=. -benchmem ./...`
 
