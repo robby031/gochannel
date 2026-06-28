@@ -229,17 +229,15 @@ func (s *subscription[V]) len() int {
 // notify sends msg to all subscriber channels sequentially.
 // Sends are non-blocking: a full channel drops the message.
 // Closed channels are detected via recover and pruned defensively.
+//
+// The RLock is held for the entire send loop so that remove cannot close a
+// channel concurrently with a send - that concurrent close+send is the data
+// race. Because every send uses a non-blocking select, the lock is never held
+// while waiting on a slow consumer.
 func (s *subscription[V]) notify(msg V) {
 	s.mu.RLock()
-	channels := make([]chan V, 0, len(s.subs))
-	for ch := range s.subs {
-		channels = append(channels, ch)
-	}
-	s.mu.RUnlock()
-
 	var dead []chan V
-
-	for _, ch := range channels {
+	for ch := range s.subs {
 		func(ch chan V) {
 			defer func() {
 				if recover() != nil {
@@ -253,6 +251,7 @@ func (s *subscription[V]) notify(msg V) {
 			}
 		}(ch)
 	}
+	s.mu.RUnlock()
 
 	if len(dead) > 0 {
 		s.mu.Lock()
