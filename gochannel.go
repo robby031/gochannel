@@ -14,7 +14,7 @@ type Channel[K comparable, V any] struct {
 // subscription holds all subscribers (channels) for a single topic.
 type subscription[V any] struct {
 	mu   sync.RWMutex
-	subs map[chan V]chan V
+	subs map[chan V]struct{}
 }
 
 // New creates a new typed pub/sub channel.
@@ -38,12 +38,16 @@ func (c *Channel[K, V]) Subscribe(topic K) <-chan V {
 // buffer size. Use a larger buffer if the subscriber may process messages
 // slower than they arrive.
 func (c *Channel[K, V]) SubscribeWithBuffer(topic K, buffer int) <-chan V {
+	if buffer < 0 {
+		panic("gochannel: buffer size must be non-negative")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	sub, ok := c.subs[topic]
 	if !ok {
-		sub = &subscription[V]{}
+		sub = &subscription[V]{subs: make(map[chan V]struct{})}
 		c.subs[topic] = sub
 	}
 
@@ -64,10 +68,10 @@ func (c *Channel[K, V]) Unsubscribe(topic K, ch <-chan V) {
 		return
 	}
 
-	// Convert to writable chan for internal tracking
 	cch := c.channelLookup(sub, ch)
-	sub.remove(cch)
-	if sub.len() == 0 {
+	// remove returns true when the subscription set is now empty, checked
+	// atomically under sub.mu — eliminating the TOCTOU between remove and len.
+	if sub.remove(cch) {
 		delete(c.subs, topic)
 	}
 }
@@ -84,8 +88,8 @@ func (c *Channel[K, V]) channelLookup(sub *subscription[V], ch <-chan V) chan V 
 }
 
 // Publish sends a message to all subscribers of the given topic.
-// It returns immediately (non-blocking) using a goroutine per subscriber.
-// If a subscriber's channel is full, the message is dropped for that subscriber.
+// It returns immediately (non-blocking). If a subscriber's channel is full,
+// the message is dropped for that subscriber.
 func (c *Channel[K, V]) Publish(topic K, msg V) {
 	c.mu.RLock()
 	sub, ok := c.subs[topic]
@@ -99,6 +103,10 @@ func (c *Channel[K, V]) Publish(topic K, msg V) {
 // Broadcast sends a message to all subscribers across all topics.
 func (c *Channel[K, V]) Broadcast(msg V) {
 	c.mu.RLock()
+	if len(c.subs) == 0 {
+		c.mu.RUnlock()
+		return
+	}
 	subs := make([]*subscription[V], 0, len(c.subs))
 	for _, sub := range c.subs {
 		subs = append(subs, sub)
@@ -114,6 +122,10 @@ func (c *Channel[K, V]) Broadcast(msg V) {
 // except the given topic.
 func (c *Channel[K, V]) BroadcastExcept(topic K, msg V) {
 	c.mu.RLock()
+	if len(c.subs) == 0 {
+		c.mu.RUnlock()
+		return
+	}
 	subs := make([]*subscription[V], 0, len(c.subs))
 	for id, sub := range c.subs {
 		if id != topic {
@@ -176,30 +188,26 @@ func (c *Channel[K, V]) Close() {
 func (s *subscription[V]) add(ch chan V) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if s.subs == nil {
-		s.subs = map[chan V]chan V{ch: ch}
-	} else {
-		s.subs[ch] = ch
-	}
+	s.subs[ch] = struct{}{}
 }
 
-func (s *subscription[V]) remove(ch chan V) {
+// remove deletes ch from the subscriber set and closes it.
+// It returns true if the set is now empty, checked atomically under the lock
+// to prevent a TOCTOU race with notify's dead-channel cleanup.
+func (s *subscription[V]) remove(ch chan V) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if ch == nil {
-		return
+	if ch != nil {
+		if _, ok := s.subs[ch]; ok {
+			delete(s.subs, ch)
+			func() {
+				defer func() { recover() }()
+				close(ch)
+			}()
+		}
 	}
-	if _, ok := s.subs[ch]; ok {
-		delete(s.subs, ch)
-		func() {
-			if r := recover(); r != nil {
-				// channel already closed
-			}
-		}()
-		close(ch)
-	}
+	return len(s.subs) == 0
 }
 
 func (s *subscription[V]) close() {
@@ -218,9 +226,9 @@ func (s *subscription[V]) len() int {
 	return len(s.subs)
 }
 
-// notify sends a message to all subscriber channels concurrently.
-// It recovers from panics caused by sending to a closed channel and
-// removes dead subscribers.
+// notify sends msg to all subscriber channels sequentially.
+// Sends are non-blocking: a full channel drops the message.
+// Channels that have been closed externally are detected via recover and pruned.
 func (s *subscription[V]) notify(msg V) {
 	s.mu.RLock()
 	channels := make([]chan V, 0, len(s.subs))
@@ -229,24 +237,15 @@ func (s *subscription[V]) notify(msg V) {
 	}
 	s.mu.RUnlock()
 
-	var (
-		dead     []chan V
-		deadLock sync.Mutex
-		wg       sync.WaitGroup
-	)
+	var dead []chan V
 
 	for _, ch := range channels {
-		wg.Add(1)
-		go func(ch chan V) {
-			defer wg.Done()
+		func(ch chan V) {
 			defer func() {
-				if r := recover(); r != nil {
-					deadLock.Lock()
+				if recover() != nil {
 					dead = append(dead, ch)
-					deadLock.Unlock()
 				}
 			}()
-
 			select {
 			case ch <- msg:
 			default:
@@ -254,8 +253,6 @@ func (s *subscription[V]) notify(msg V) {
 			}
 		}(ch)
 	}
-
-	wg.Wait()
 
 	if len(dead) > 0 {
 		s.mu.Lock()
