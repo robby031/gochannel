@@ -1,7 +1,7 @@
 # gochannel
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/bagussdw/gochannel.svg)](https://pkg.go.dev/github.com/bagussdw/gochannel)
-[![Go Report Card](https://goreportcard.com/badge/github.com/bagussdw/gochannel)](https://goreportcard.com/report/github.com/bagussdw/gochannel)
+[![Go Reference](https://pkg.go.dev/badge/github.com/robby031/gochannel.svg)](https://pkg.go.dev/github.com/robby031/gochannel)
+[![Go Report Card](https://goreportcard.com/badge/github.com/robby031/gochannel)](https://goreportcard.com/report/github.com/robby031/gochannel)
 
 **gochannel** is a generic, typed publish/subscribe (pub/sub) message bus for Go.
 
@@ -204,11 +204,20 @@ For distributed pub/sub across processes or machines, consider using message bro
 
 ## Performance
 
-gochannel is designed for low-latency, in-process communication. A rough benchmark:
+Benchmarked on Apple M4 (darwin/arm64) with Go 1.25.8:
 
-- Publish to a topic with 1 subscriber: ~200-300ns
-- Publish to a topic with 10 subscribers: ~1-3μs
-- Broadcast to 10 topics: ~5-10μs
+| Operation | Time/op | Bytes/op | Allocs/op |
+|-----------|--------:|---------:|----------:|
+| **Publish** — no subscribers | 3.65 ns | 0 B | 0 |
+| **Publish** — 1 subscriber | 460 ns | 120 B | 5 |
+| **Publish** — 10 subscribers | 3,007 ns | 848 B | 24 |
+| **Publish** — 100 subscribers | 18,396 ns | 8,144 B | 204 |
+| **Broadcast** — 10 topics (1 sub each) | 4,330 ns | 1,280 B | 51 |
+| **Concurrent Publish** — 10 goroutines | 267 ns | 120 B | 5 |
+| **Subscribe + Unsubscribe** | 183 ns | 416 B | 4 |
+| **HasSubscribers** | 8.3 ns | 0 B | 0 |
+
+> Run the benchmarks yourself: `go test -bench=. -benchmem ./...`
 
 The library is non-blocking by design: publishers never wait for slow consumers. If a subscriber's channel buffer is full, the message is dropped for that subscriber.
 
