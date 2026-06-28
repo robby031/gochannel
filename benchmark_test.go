@@ -80,10 +80,11 @@ func BenchmarkPublish100Subscribers(b *testing.B) {
 func BenchmarkBroadcast10Topics(b *testing.B) {
 	ch := New[string, int]()
 
+	topics := make([]string, 10)
 	subs := make([]<-chan int, 10)
 	for i := 0; i < 10; i++ {
-		topic := b.Name() + string(rune('0'+i))
-		subs[i] = ch.Subscribe(topic)
+		topics[i] = b.Name() + string(rune('0'+i))
+		subs[i] = ch.Subscribe(topics[i])
 	}
 
 	for _, sub := range subs {
@@ -97,9 +98,10 @@ func BenchmarkBroadcast10Topics(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ch.Broadcast(i)
 	}
+	b.StopTimer()
 
-	for _, sub := range subs {
-		ch.Unsubscribe("test", sub)
+	for i, sub := range subs {
+		ch.Unsubscribe(topics[i], sub)
 	}
 }
 
