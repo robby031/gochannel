@@ -1,6 +1,7 @@
 package gochannel
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -521,5 +522,112 @@ func TestPointerValues(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+// Testing for SubscribeCtx
+func TestSubscribeCtx(t *testing.T) {
+	ch := New[string, string]()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sub := ch.SubscribeCtx(ctx, "test-ctx")
+
+	if ch.SubscriberCount("test-ctx") != 1 {
+		t.Fatalf("expected 1 subscriber, got %d", ch.SubscriberCount("test-ctx"))
+	}
+
+	cancel()
+
+	time.Sleep(10 * time.Millisecond)
+
+	if ch.SubscriberCount("test-ctx") != 0 {
+		t.Fatalf("expected 0 subscribers after context cancel, got %d", ch.SubscriberCount("test-ctx"))
+	}
+
+	select {
+	case _, ok := <-sub:
+		if ok {
+			t.Fatal("expected channel to be closed after context cancellation")
+		}
+	default:
+		t.Fatal("expected channel to be closed immediately")
+	}
+}
+
+// Buffer Validation Testing 0
+func TestSubscribeZeroBufferPanic(t *testing.T) {
+	ch := New[string, string]()
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when subscribing with buffer <= 0")
+		}
+	}()
+
+	ch.SubscribeWithBuffer("test-buffer", 0)
+}
+
+// Close Status Testing and New Subscriber Validation
+func TestCloseAndPanicOnNewSubscribe(t *testing.T) {
+	ch := New[string, string]()
+	sub1 := ch.Subscribe("topic1")
+
+	ch.Close()
+	ch.Close()
+
+	if _, ok := <-sub1; ok {
+		t.Fatal("expected sub1 to be closed")
+	}
+
+	ch.Publish("topic1", "data")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when subscribing to a closed channel")
+		}
+	}()
+
+	ch.Subscribe("topic2")
+}
+
+// Testing the Dropped Counter and OnDrop Callback Features
+func TestDropTrackingAndCallback(t *testing.T) {
+	ch := New[string, int]()
+
+	var mu sync.Mutex
+	var droppedTopics []string
+	var droppedValues []int
+
+	ch.OnDrop = func(topic string, msg int) {
+		mu.Lock()
+		defer mu.Unlock()
+		droppedTopics = append(droppedTopics, topic)
+		droppedValues = append(droppedValues, msg)
+	}
+
+	sub := ch.SubscribeWithBuffer("topic-drop", 1)
+	defer ch.Unsubscribe("topic-drop", sub)
+
+	ch.Publish("topic-drop", 100)
+	ch.Publish("topic-drop", 200)
+	ch.Publish("topic-drop", 300)
+
+	if droppedCount := ch.Dropped.Load(); droppedCount != 2 {
+		t.Fatalf("expected 2 dropped messages, got %d", droppedCount)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(droppedValues) != 2 {
+		t.Fatalf("expected 2 messages in OnDrop callback, got %d", len(droppedValues))
+	}
+
+	if droppedValues[0] != 200 || droppedValues[1] != 300 {
+		t.Fatalf("unexpected dropped values, got %v", droppedValues)
+	}
+
+	if droppedTopics[0] != "topic-drop" {
+		t.Fatalf("unexpected dropped topic, got %s", droppedTopics[0])
 	}
 }

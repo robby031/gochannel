@@ -3,20 +3,19 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/robby031/gochannel.svg)](https://pkg.go.dev/github.com/robby031/gochannel)
 [![Go Report Card](https://goreportcard.com/badge/github.com/robby031/gochannel)](https://goreportcard.com/report/github.com/robby031/gochannel)
 
-**gochannel** is a generic, typed publish/subscribe (pub/sub) message bus for Go.
-
-It allows producers and consumers to communicate through topics without being directly coupled to each other. The library is fully generic, typesafe, and thread-safe, with **zero external dependencies**.
+**gochannel** is a generic, typed publish/subscribe (pub/sub) message bus for Go. It allows producers and consumers to communicate through topics without being directly coupled to each other. The library is fully generic, typesafe, and thread-safe, with **zero external dependencies**.
 
 ## Features
 
-- ✅ **Generic & Type-Safe** — Full Go generics support (`Channel[K comparable, V any]`)
-- ✅ **Zero Dependencies** — Pure standard library, no external packages required
-- ✅ **Thread-Safe** — All operations are safe for concurrent use
-- ✅ **Buffered Channels** — Configurable buffer size per subscriber
-- ✅ **Topic-Based** — Subscribe to specific topics, broadcast to all
-- ✅ **Non-Blocking Publish** — Publishers never block, slow subscribers drop messages
-- ✅ **Panic-Safe** — Gracefully handles closed channels and dead subscribers
-- ✅ **Clean Shutdown** — `Close()` method to properly tear down all subscribers
+- **Generic & Type-Safe** — Full Go generics support (`Channel[K comparable, V any]`)
+- **Zero Dependencies** — Pure standard library, no external packages required
+- **Thread-Safe** — All operations are safe for concurrent use
+- **Context-Aware Subscriptions** — `SubscribeCtx` automatically cleans up subscriptions when context cancels to prevent goroutine leaks
+- **Drop Monitoring** — Built-in atomic counter (`Dropped`) and `OnDrop` callback for logging discarded messages
+- **Explicit Closed State** — Prevents new subscriptions after `Close()` and gracefully handles double-close
+- **Buffered Channels** — Configurable buffer size per subscriber (buffer size must be > 0)
+- **Topic-Based** — Subscribe to specific topics, broadcast to all
+- **Non-Blocking Publish** — Publishers never block, slow subscribers drop messages safely
 
 ## Installation
 
@@ -30,32 +29,37 @@ go get github.com/robby031/gochannel
 package main
 
 import (
-    "fmt"
-    "time"
-    "github.com/robby031/gochannel"
+	"fmt"
+
+	"github.com/robby031/gochannel"
 )
 
 func main() {
-    // Create a channel with string keys and string values
-    ch := gochannel.New[string, string]()
+	// Create a channel with string keys and string values
+	ch := gochannel.New[string, string]()
 
-    // Subscribe to a topic
-    sub := ch.Subscribe("orders")
-    defer ch.Unsubscribe("orders", sub)
+	// Optional: monitor dropped messages when subscriber buffers are full
+	ch.OnDrop = func(topic string, msg string) {
+		fmt.Printf("Warning: message dropped on topic '%s': %s\n", topic, msg)
+	}
 
-    // Publish messages in a goroutine
-    go func() {
-        ch.Publish("orders", "New order received!")
-        ch.Publish("orders", "Order #1234 completed")
-    }()
+	// Subscribe to a topic
+	sub := ch.Subscribe("orders")
+	defer ch.Unsubscribe("orders", sub)
 
-    // Receive messages
-    for msg := range sub {
-        fmt.Println("Received:", msg)
-        if msg == "Order #1234 completed" {
-            break
-        }
-    }
+	// Publish messages
+	go func() {
+		ch.Publish("orders", "New order received!")
+		ch.Publish("orders", "Order #1234 completed")
+	}()
+
+	// Receive messages
+	for msg := range sub {
+		fmt.Println("Received:", msg)
+		if msg == "Order #1234 completed" {
+			break
+		}
+	}
 }
 ```
 
@@ -70,29 +74,25 @@ ch := gochannel.New[string, string]()
 // Int keys, custom struct values
 type Event struct { ID int; Name string }
 ch := gochannel.New[int, Event]()
-
-// String keys, pointer values
-ch := gochannel.New[string, *MyStruct]()
 ```
 
 ### Subscribing
+
+Note: Buffer size must always be greater than `0`. Subscribing with a buffer size `<= 0` will panic to prevent guaranteed message drops.
 
 ```go
 // Subscribe with default buffer size (10)
 sub := ch.Subscribe("topic")
 
-// Subscribe with custom buffer size
+// Subscribe with custom buffer size (> 0 required)
 sub := ch.SubscribeWithBuffer("topic", 100)
 
-// sub is a receive-only channel (<-chan V)
-go func() {
-    for msg := range sub {
-        fmt.Println(msg)
-    }
-}()
+// Context-aware subscribe (automatically unsubscribes when ctx is cancelled)
+sub := ch.SubscribeCtx(ctx, "topic")
+sub := ch.SubscribeCtxWithBuffer(ctx, "topic", 100)
 ```
 
-### Publishing
+### Publishing & Drop Monitoring
 
 ```go
 // Publish to a specific topic
@@ -103,6 +103,14 @@ ch.Broadcast("system-wide notification")
 
 // Broadcast to all topics except one
 ch.BroadcastExcept("topic", "secret message")
+
+// Check total dropped messages across all subscribers
+totalDropped := ch.Dropped.Load()
+
+// Register a callback for dropped messages
+ch.OnDrop = func(topic string, msg MyMessageType) {
+    log.Printf("[DROP WARNING] Topic: %v, Msg: %v", topic, msg)
+}
 ```
 
 ### Topic Management
@@ -120,107 +128,57 @@ count := ch.SubscriberCount("topic")
 topics := ch.TopicCount()
 ```
 
-### Cleanup
+### Cleanup & Lifecycle
 
 ```go
 // Unsubscribe a specific subscriber
 ch.Unsubscribe("topic", sub)
 
-// Close all subscribers across all topics
+// Close channel and all subscriber channels across all topics.
+// Subscribing to a closed channel will panic.
 ch.Close()
 ```
 
 ## Advanced Examples
 
-### Multiple Subscribers per Topic
+### Preventing Goroutine Leaks with Context
 
 ```go
-ch := gochannel.New[string, string]()
+func handleUserSession(ctx context.Context, bus *gochannel.Channel[string, string], userID string) {
+    // Automatically unsubscribes when ctx is done (HTTP request cancel, timeout, etc.)
+    sub := bus.SubscribeCtx(ctx, "user-events-"+userID)
 
-sub1 := ch.Subscribe("broadcast")
-sub2 := ch.Subscribe("broadcast")
-defer ch.Unsubscribe("broadcast", sub1)
-defer ch.Unsubscribe("broadcast", sub2)
-
-ch.Publish("broadcast", "Message to all subscribers")
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case msg, ok := <-sub:
+            if !ok {
+                return // Channel closed by bus.Close()
+            }
+            fmt.Printf("User event: %s\n", msg)
+        }
+    }
+}
 ```
 
-### Struct Messages
+### Monitoring Drop Rates under Heavy Load
 
 ```go
-type OrderEvent struct {
-    OrderID   string
-    Status    string
-    Timestamp time.Time
+bus := gochannel.New[string, EventData]()
+
+bus.OnDrop = func(topic string, msg EventData) {
+    metrics.Incr("pubsub.message_dropped", []string{"topic:" + topic})
 }
 
-ch := gochannel.New[string, OrderEvent]()
-sub := ch.Subscribe("orders")
-defer ch.Unsubscribe("orders", sub)
-
+// Check aggregate drops periodically
 go func() {
-    ch.Publish("orders", OrderEvent{
-        OrderID: "ORD-001",
-        Status:  "completed",
-    })
+    for range time.Tick(1 * time.Minute) {
+        fmt.Printf("Total dropped messages in last minute: %d\n", bus.Dropped.Swap(0))
+    }
 }()
-
-event := <-sub
-fmt.Printf("Order %s is %s\n", event.OrderID, event.Status)
 ```
-
-### Non-Blocking Broadcast Pattern
-
-```go
-type UpdateEvent struct {
-    Event string
-    Data  interface{}
-}
-
-// Simulating the pattern from a real gateway application
-bus := gochannel.New[string, *UpdateEvent]()
-
-// WebSocket client subscribes
-clientCh := bus.Subscribe("ws-client-1")
-
-// Notification service broadcasts
-bus.Publish("ws-client-1", &UpdateEvent{
-    Event: "transaction_updated",
-    Data:  map[string]interface{}{"status": "paid"},
-})
-```
-
-## When to Use gochannel
-
-gochannel is ideal for:
-
-- **Event-driven architectures** within a single process
-- **Real-time notification systems** (WebSocket broadcast, status updates)
-- **In-process message passing** between goroutines/workers
-- **Plugin/hook systems** where multiple components react to events
-- **Decoupling producers from consumers** in medium-complexity Go applications
-
-For distributed pub/sub across processes or machines, consider using message brokers like NATS, RabbitMQ, or Redis Pub/Sub instead.
-
-## Performance
-
-Benchmarked on Apple M4 (darwin/arm64) with Go 1.25.8:
-
-| Operation | Time/op | Bytes/op | Allocs/op |
-|-----------|--------:|---------:|----------:|
-| **Publish** — no subscribers | 3.65 ns | 0 B | 0 |
-| **Publish** — 1 subscriber | 66 ns | 0 B | 0 |
-| **Publish** — 10 subscribers | 703 ns | 80 B | 1 |
-| **Publish** — 100 subscribers | 7,791 ns | 896 B | 1 |
-| **Broadcast** — 10 topics (1 sub each) | 1,460 ns | 80 B | 1 |
-| **Concurrent Publish** — 10 goroutines | 105 ns | 0 B | 0 |
-| **Subscribe + Unsubscribe** | 169 ns | 416 B | 4 |
-| **HasSubscribers** | 8.4 ns | 0 B | 0 |
-
-> Run the benchmarks yourself: `go test -bench=. -benchmem ./...`
-
-The library is non-blocking by design: publishers never wait for slow consumers. If a subscriber's channel buffer is full, the message is dropped for that subscriber.
 
 ## License
 
-MIT
+MIT License

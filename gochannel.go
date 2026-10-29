@@ -1,14 +1,24 @@
 package gochannel
 
-import "sync"
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+)
 
 // Channel is a generic, typed publish/subscribe message bus.
 //
 // K is the topic key type (must be comparable, e.g. string, int).
 // V is the message value type (any type).
 type Channel[K comparable, V any] struct {
-	mu   sync.RWMutex
-	subs map[K]*subscription[V]
+	mu     sync.RWMutex
+	subs   map[K]*subscription[V]
+	closed bool
+
+	// Atomic counter to track total discarded messages
+	Dropped atomic.Uint64
+	// Optional callback that is executed when a message fails to send.
+	OnDrop func(topic K, msg V)
 }
 
 // subscription holds all subscribers (channels) for a single topic.
@@ -38,12 +48,17 @@ func (c *Channel[K, V]) Subscribe(topic K) <-chan V {
 // buffer size. Use a larger buffer if the subscriber may process messages
 // slower than they arrive.
 func (c *Channel[K, V]) SubscribeWithBuffer(topic K, buffer int) <-chan V {
-	if buffer < 0 {
-		panic("gochannel: buffer size must be non-negative")
+	if buffer <= 0 {
+		panic("gochannel: buffer size must be greater than 0 to prevent guaranteed message drops")
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Reject new subscribers if the channel is closed
+	if c.closed {
+		panic("gochannel: cannot subscribe to a closed channel")
+	}
 
 	sub, ok := c.subs[topic]
 	if !ok {
@@ -53,6 +68,23 @@ func (c *Channel[K, V]) SubscribeWithBuffer(topic K, buffer int) <-chan V {
 
 	ch := make(chan V, buffer)
 	sub.add(ch)
+	return ch
+}
+
+// SubscribeCtx creates a subscriber that will automatically unsubscribe when the context is finished.
+func (c *Channel[K, V]) SubscribeCtx(ctx context.Context, topic K) <-chan V {
+	return c.SubscribeCtxWithBuffer(ctx, topic, 10)
+}
+
+// SubscribeCtxWithBuffer is a version of SubscribeCtx with buffer size customization.
+func (c *Channel[K, V]) SubscribeCtxWithBuffer(ctx context.Context, topic K, buffer int) <-chan V {
+	ch := c.SubscribeWithBuffer(topic, buffer)
+
+	go func() {
+		<-ctx.Done()
+		c.Unsubscribe(topic, ch)
+	}()
+
 	return ch
 }
 
@@ -92,29 +124,38 @@ func (c *Channel[K, V]) channelLookup(sub *subscription[V], ch <-chan V) chan V 
 // the message is dropped for that subscriber.
 func (c *Channel[K, V]) Publish(topic K, msg V) {
 	c.mu.RLock()
+	if c.closed { // Prevent publishing if it is already closed
+		c.mu.RUnlock()
+		return
+	}
 	sub, ok := c.subs[topic]
 	c.mu.RUnlock()
 
 	if ok {
-		sub.notify(msg)
+		c.notify(topic, sub, msg)
 	}
 }
 
 // Broadcast sends a message to all subscribers across all topics.
 func (c *Channel[K, V]) Broadcast(msg V) {
 	c.mu.RLock()
-	if len(c.subs) == 0 {
+	if c.closed || len(c.subs) == 0 {
 		c.mu.RUnlock()
 		return
 	}
-	subs := make([]*subscription[V], 0, len(c.subs))
-	for _, sub := range c.subs {
-		subs = append(subs, sub)
+
+	type target struct {
+		topic K
+		sub   *subscription[V]
+	}
+	targets := make([]target, 0, len(c.subs))
+	for topic, sub := range c.subs {
+		targets = append(targets, target{topic: topic, sub: sub})
 	}
 	c.mu.RUnlock()
 
-	for _, sub := range subs {
-		sub.notify(msg)
+	for _, t := range targets {
+		c.notify(t.topic, t.sub, msg)
 	}
 }
 
@@ -122,20 +163,61 @@ func (c *Channel[K, V]) Broadcast(msg V) {
 // except the given topic.
 func (c *Channel[K, V]) BroadcastExcept(topic K, msg V) {
 	c.mu.RLock()
-	if len(c.subs) == 0 {
+	if c.closed || len(c.subs) == 0 {
 		c.mu.RUnlock()
 		return
 	}
-	subs := make([]*subscription[V], 0, len(c.subs))
+
+	type target struct {
+		topic K
+		sub   *subscription[V]
+	}
+	targets := make([]target, 0, len(c.subs))
 	for id, sub := range c.subs {
 		if id != topic {
-			subs = append(subs, sub)
+			targets = append(targets, target{topic: id, sub: sub})
 		}
 	}
 	c.mu.RUnlock()
 
-	for _, sub := range subs {
-		sub.notify(msg)
+	for _, t := range targets {
+		c.notify(t.topic, t.sub, msg)
+	}
+}
+
+func (c *Channel[K, V]) notify(topic K, sub *subscription[V], msg V) {
+	sub.mu.RLock()
+	var dead []chan V
+
+	for ch := range sub.subs {
+		func(ch chan V) {
+			defer func() {
+				if recover() != nil {
+					dead = append(dead, ch)
+				}
+			}()
+
+			select {
+			case ch <- msg:
+				// Message sent successfully
+			default:
+				// channel full, handle drop
+				c.Dropped.Add(1)
+				if c.OnDrop != nil {
+					c.OnDrop(topic, msg)
+				}
+			}
+		}(ch)
+	}
+	sub.mu.RUnlock()
+
+	// Cleanup of dead channels
+	if len(dead) > 0 {
+		sub.mu.Lock()
+		for _, ch := range dead {
+			delete(sub.subs, ch)
+		}
+		sub.mu.Unlock()
 	}
 }
 
@@ -177,6 +259,12 @@ func (c *Channel[K, V]) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Prevent silent double-close
+	if c.closed {
+		return
+	}
+	c.closed = true
+
 	for topic, sub := range c.subs {
 		sub.close()
 		delete(c.subs, topic)
@@ -184,7 +272,6 @@ func (c *Channel[K, V]) Close() {
 }
 
 // subscription internal methods
-
 func (s *subscription[V]) add(ch chan V) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,40 +311,4 @@ func (s *subscription[V]) len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.subs)
-}
-
-// notify sends msg to all subscriber channels sequentially.
-// Sends are non-blocking: a full channel drops the message.
-// Closed channels are detected via recover and pruned defensively.
-//
-// The RLock is held for the entire send loop so that remove cannot close a
-// channel concurrently with a send - that concurrent close+send is the data
-// race. Because every send uses a non-blocking select, the lock is never held
-// while waiting on a slow consumer.
-func (s *subscription[V]) notify(msg V) {
-	s.mu.RLock()
-	var dead []chan V
-	for ch := range s.subs {
-		func(ch chan V) {
-			defer func() {
-				if recover() != nil {
-					dead = append(dead, ch)
-				}
-			}()
-			select {
-			case ch <- msg:
-			default:
-				// channel full, drop message
-			}
-		}(ch)
-	}
-	s.mu.RUnlock()
-
-	if len(dead) > 0 {
-		s.mu.Lock()
-		for _, ch := range dead {
-			delete(s.subs, ch)
-		}
-		s.mu.Unlock()
-	}
 }
